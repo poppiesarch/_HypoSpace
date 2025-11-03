@@ -1,0 +1,263 @@
+{
+  "metadata": {
+    "grid_size": 3,
+    "max_blocks": 1,
+    "max_height": 3,
+    "n_observation_sets": 9,
+    "generated_at": "2025-10-25T03:09:04.745517"
+  },
+  "observation_sets": [
+    {
+      "observation_id": "g3_h3_b1_001",
+      "observation": "100000000",
+      "ground_truth_structures": [
+        {
+          "layers": [
+            "100000000"
+          ],
+          "hash": "ef9f57a2"
+        },
+        {
+          "layers": [
+            "100000000",
+            "100000000"
+          ],
+          "hash": "220f782d"
+        },
+        {
+          "layers": [
+            "100000000",
+            "100000000",
+            "100000000"
+          ],
+          "hash": "2a9b8eaf"
+        }
+      ],
+      "n_compatible_structures": 3
+    },
+    {
+      "observation_id": "g3_h3_b1_002",
+      "observation": "010000000",
+      "ground_truth_structures": [
+        {
+          "layers": [
+            "010000000"
+          ],
+          "hash": "04934ec0"
+        },
+        {
+          "layers": [
+            "010000000",
+            "010000000"
+          ],
+          "hash": "f51ade8f"
+        },
+        {
+          "layers": [
+            "010000000",
+            "010000000",
+            "010000000"
+          ],
+          "hash": "f175a47d"
+        }
+      ],
+      "n_compatible_structures": 3
+    },
+    {
+      "observation_id": "g3_h3_b1_003",
+      "observation": "001000000",
+      "ground_truth_structures": [
+        {
+          "layers": [
+            "001000000"
+          ],
+          "hash": "ca18a885"
+        },
+        {
+          "layers": [
+            "001000000",
+            "001000000"
+          ],
+          "hash": "c219435d"
+        },
+        {
+          "layers": [
+            "001000000",
+            "001000000",
+            "001000000"
+          ],
+          "hash": "27e6a271"
+        }
+      ],
+      "n_compatible_structures": 3
+    },
+    {
+      "observation_id": "g3_h3_b1_004",
+      "observation": "000100000",
+      "ground_truth_structures": [
+        {
+          "layers": [
+            "000100000"
+          ],
+          "hash": "063ef50b"
+        },
+        {
+          "layers": [
+            "000100000",
+            "000100000"
+          ],
+          "hash": "598a003d"
+        },
+        {
+          "layers": [
+            "000100000",
+            "000100000",
+            "000100000"
+          ],
+          "hash": "4ed49253"
+        }
+      ],
+      "n_compatible_structures": 3
+    },
+    {
+      "observation_id": "g3_h3_b1_005",
+      "observation": "000010000",
+      "ground_truth_structures": [
+        {
+          "layers": [
+            "000010000"
+          ],
+          "hash": "a076851a"
+        },
+        {
+          "layers": [
+            "000010000",
+            "000010000"
+          ],
+          "hash": "6353a02c"
+        },
+        {
+          "layers": [
+            "000010000",
+            "000010000",
+            "000010000"
+          ],
+          "hash": "90e9fdf8"
+        }
+      ],
+      "n_compatible_structures": 3
+    },
+    {
+      "observation_id": "g3_h3_b1_006",
+      "observation": "000001000",
+      "ground_truth_structures": [
+        {
+          "layers": [
+            "000001000"
+          ],
+          "hash": "1d3a9939"
+        },
+        {
+          "layers": [
+            "000001000",
+            "000001000"
+          ],
+          "hash": "1118f51e"
+        },
+        {
+          "layers": [
+            "000001000",
+            "000001000",
+            "000001000"
+          ],
+          "hash": "debddb51"
+        }
+      ],
+      "n_compatible_structures": 3
+    },
+    {
+      "observation_id": "g3_h3_b1_007",
+      "observation": "000000100",
+      "ground_truth_structures": [
+        {
+          "layers": [
+            "000000100"
+          ],
+          "hash": "e211098c"
+        },
+        {
+          "layers": [
+            "000000100",
+            "000000100"
+          ],
+          "hash": "e9bce711"
+        },
+        {
+          "layers": [
+            "000000100",
+            "000000100",
+            "000000100"
+          ],
+          "hash": "cde3e6b4"
+        }
+      ],
+      "n_compatible_structures": 3
+    },
+    {
+      "observation_id": "g3_h3_b1_008",
+      "observation": "000000010",
+      "ground_truth_structures": [
+        {
+          "layers": [
+            "000000010"
+          ],
+          "hash": "a3cac4cf"
+        },
+        {
+          "layers": [
+            "000000010",
+            "000000010"
+          ],
+          "hash": "71eccb84"
+        },
+        {
+          "layers": [
+            "000000010",
+            "000000010",
+            "000000010"
+          ],
+          "hash": "faf67641"
+        }
+      ],
+      "n_compatible_structures": 3
+    },
+    {
+      "observation_id": "g3_h3_b1_009",
+      "observation": "000000001",
+      "ground_truth_structures": [
+        {
+          "layers": [
+            "000000001"
+          ],
+          "hash": "525d41b7"
+        },
+        {
+          "layers": [
+            "000000001",
+            "000000001"
+          ],
+          "hash": "373435c0"
+        },
+        {
+          "layers": [
+            "000000001",
+            "000000001",
+            "000000001"
+          ],
+          "hash": "2efef214"
+        }
+      ],
+      "n_compatible_structures": 3
+    }
+  ]
+}

@@ -49,27 +49,38 @@ def _extract_usage(resp):
     total_tokens = getattr(u, "total_tokens", input_tokens + output_tokens)
     return input_tokens, output_tokens, total_tokens
 
+
 class LLMInterface(ABC):
     """Abstract interface for LLM interaction."""
     
     @abstractmethod
-    def query(self, prompt: str) -> str:
+    def query(self, prompt: str, **kwargs) -> str:
         """
         Query the LLM with a prompt and return response.
         
         Args:
             prompt: The prompt to send to the LLM
+            **kwargs: Optional parameters (temperature, top_p, etc.)
         
         Returns:
             The LLM's response as a string
         """
         pass
     
-    def query_with_usage(self, prompt: str) -> Dict[str, Any]:
-        """Query the LLM and return response with usage stats."""
+    def query_with_usage(self, prompt: str, **kwargs) -> Dict[str, Any]:
+        """
+        Query the LLM and return response with usage stats.
+        
+        Args:
+            prompt: The prompt to send to the LLM
+            **kwargs: Optional parameters (temperature, top_p, repetition_penalty, etc.)
+        
+        Returns:
+            Dict with 'response', 'usage', and 'cost'
+        """
         # Default implementation for backward compatibility
         return {
-            'response': self.query(prompt),
+            'response': self.query(prompt, **kwargs),
             'usage': {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
             'cost': 0.0
         }
@@ -110,7 +121,7 @@ class OpenRouterLLM(LLMInterface):
         Args:
             model: Model identifier (e.g., "anthropic/claude-3.5-sonnet", "openai/gpt-4")
             api_key: OpenRouter API key
-            temperature: Sampling temperature
+            temperature: Sampling temperature (default)
             max_tokens: Maximum tokens in response
             base_url: OpenRouter API base URL
         """
@@ -119,23 +130,37 @@ class OpenRouterLLM(LLMInterface):
         
         self.model = model
         self.api_key = api_key
-        self.temperature = temperature
+        self.default_temperature = temperature
         self.max_tokens = max_tokens
         self.base_url = base_url
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
-            # "HTTP-Referer":"http://localhost:3000",  # Required by OpenRouter
-            # "X-Title": "Cre ativity Benchmark"  # Optional, for OpenRouter dashboard
         }
     
-    def query(self, prompt: str) -> str:
+    def query(self, prompt: str, **kwargs) -> str:
         """Query OpenRouter API."""
-        result = self.query_with_usage(prompt)
+        result = self.query_with_usage(prompt, **kwargs)
         return result['response']
     
-    def query_with_usage(self, prompt: str) -> Dict[str, Any]:
-        """Query OpenRouter API with usage tracking."""
+    def query_with_usage(
+        self,
+        prompt: str,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Query OpenRouter API with usage tracking.
+        
+        Args:
+            prompt: The prompt to send
+            temperature: Sampling temperature (overrides default if provided)
+            top_p: Nucleus sampling parameter (0.0-1.0)
+            repetition_penalty: Penalty for repeating tokens (>1.0 discourages repetition)
+            **kwargs: Additional parameters
+        """
         try:
             url = f"{self.base_url}/chat/completions"
             payload = {
@@ -144,16 +169,24 @@ class OpenRouterLLM(LLMInterface):
                     {"role": "system", "content": "You are an expert in causal inference and graph theory."},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": self.temperature,
+                "temperature": temperature if temperature is not None else self.default_temperature,
                 "max_tokens": self.max_tokens
             }
             
-            response = requests.post(url, headers=self.headers, json=payload)
+            # Add optional parameters if provided
+            if top_p is not None:
+                payload["top_p"] = top_p
+            
+            # Note: OpenRouter may not support repetition_penalty directly
+            # Use frequency_penalty as approximation (supported by most models)
+            if repetition_penalty is not None and repetition_penalty != 1.0:
+                # Convert repetition_penalty (typically 1.0-1.5) to frequency_penalty (typically 0.0-2.0)
+                payload["frequency_penalty"] = min((repetition_penalty - 1.0) * 2, 2.0)
+            
+            response = requests.post(url, headers=self.headers, json=payload, timeout=120)
             response.raise_for_status()
-            # print('result0',response)
             result = response.json()
-            # print('result1',result['choices'][0]['message']['content'])
-            # print('result2',result)
+            
             # Extract usage information
             usage = result.get('usage', {})
             usage_data = {
@@ -224,7 +257,7 @@ class OpenAILLM(LLMInterface):
         Args:
             model: OpenAI model to use
             api_key: OpenAI API key (uses environment variable if not provided)
-            temperature: Sampling temperature
+            temperature: Sampling temperature (default)
             max_tokens: Maximum tokens in response
         """
         try:
@@ -233,7 +266,7 @@ class OpenAILLM(LLMInterface):
             raise ImportError("Please install openai package: pip install openai")
         
         self.model = model
-        self.temperature = temperature
+        self.default_temperature = temperature
         self.max_tokens = max_tokens
         
         if not api_key:
@@ -244,23 +277,52 @@ class OpenAILLM(LLMInterface):
         
         self.client = openai.OpenAI(api_key=api_key)
     
-    def query(self, prompt: str) -> str:
+    def query(self, prompt: str, **kwargs) -> str:
         """Query OpenAI API."""
-        result = self.query_with_usage(prompt)
+        result = self.query_with_usage(prompt, **kwargs)
         return result['response']
     
-    def query_with_usage(self, prompt: str) -> Dict[str, Any]:
+    def query_with_usage(
+        self,
+        prompt: str,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Query OpenAI API with usage tracking.
+        
+        Args:
+            prompt: The prompt to send
+            temperature: Sampling temperature (overrides default if provided)
+            top_p: Nucleus sampling parameter (0.0-1.0)
+            repetition_penalty: Penalty for repeating tokens (>1.0 discourages repetition)
+            **kwargs: Additional parameters
+        """
         try:
-            # print(self.max_tokens)
-            resp = self.client.responses.create(
-                model=self.model,
-                input=[
+            # Build request parameters
+            request_params = {
+                "model": self.model,
+                "input": [
                     {"role": "system", "content": "You are an expert in causal inference and graph theory."},
                     {"role": "user", "content": prompt},
                 ],
-                reasoning={"effort": "medium"},
-                max_output_tokens=self.max_tokens
-            )
+                "reasoning": {"effort": "medium"},
+                "max_output_tokens": self.max_tokens
+            }
+            
+            # Add temperature if provided (otherwise use model default)
+            if temperature is not None:
+                request_params["temperature"] = temperature
+            elif self.default_temperature != 0.7:  # Only set if non-default
+                request_params["temperature"] = self.default_temperature
+            
+            # Note: OpenAI Responses API may not support all sampling parameters
+            # top_p and repetition_penalty might not be available
+            # Check API documentation for current support
+            
+            resp = self.client.responses.create(**request_params)
 
             text = _extract_text(resp)
             in_tok, out_tok, tot_tok = _extract_usage(resp)
@@ -268,7 +330,6 @@ class OpenAILLM(LLMInterface):
             pricing = self.get_model_pricing()
             cost = (in_tok * pricing['input'] + out_tok * pricing['output']) / 1_000_000
 
-            # print(text)
             return {
                 "response": text,
                 "usage": {
@@ -313,7 +374,7 @@ class AnthropicLLM(LLMInterface):
         model: str = "claude-3-opus-20240229",
         api_key: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 500
+        max_tokens: int = 4096
     ):
         """
         Initialize Anthropic LLM interface.
@@ -321,7 +382,7 @@ class AnthropicLLM(LLMInterface):
         Args:
             model: Anthropic model to use
             api_key: Anthropic API key (uses environment variable if not provided)
-            temperature: Sampling temperature
+            temperature: Sampling temperature (default)
             max_tokens: Maximum tokens in response
         """
         try:
@@ -330,27 +391,52 @@ class AnthropicLLM(LLMInterface):
             raise ImportError("Please install anthropic package: pip install anthropic")
         
         self.model = model
-        self.temperature = temperature
+        self.default_temperature = temperature
         self.max_tokens = max_tokens
         
         self.client = anthropic.Anthropic(api_key=api_key)
     
-    def query(self, prompt: str) -> str:
+    def query(self, prompt: str, **kwargs) -> str:
         """Query Anthropic API."""
-        result = self.query_with_usage(prompt)
+        result = self.query_with_usage(prompt, **kwargs)
         return result['response']
     
-    def query_with_usage(self, prompt: str) -> Dict[str, Any]:
-        """Query Anthropic API with usage tracking."""
+    def query_with_usage(
+        self,
+        prompt: str,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Query Anthropic API with usage tracking.
+        
+        Args:
+            prompt: The prompt to send
+            temperature: Sampling temperature (overrides default if provided)
+            top_p: Nucleus sampling parameter (0.0-1.0)
+            repetition_penalty: Not supported by Anthropic API (ignored)
+            **kwargs: Additional parameters
+        """
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                # max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                messages=[
+            request_params = {
+                "model": self.model,
+                "max_tokens": self.max_tokens,
+                "temperature": temperature if temperature is not None else self.default_temperature,
+                "messages": [
                     {"role": "user", "content": prompt}
                 ]
-            )
+            }
+            
+            # Add top_p if provided
+            if top_p is not None:
+                request_params["top_p"] = top_p
+            
+            # Note: Anthropic doesn't support repetition_penalty directly
+            # The API uses temperature and top_p for diversity control
+            
+            response = self.client.messages.create(**request_params)
             
             # Extract usage information
             usage = {
@@ -370,6 +456,7 @@ class AnthropicLLM(LLMInterface):
                 'cost': cost
             }
         except Exception as e:
+            traceback.print_exc()
             return {
                 'response': f"Error querying Anthropic: {str(e)}",
                 'usage': {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},

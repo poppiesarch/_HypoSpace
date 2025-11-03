@@ -7,69 +7,29 @@ import re
 from .models import CausalGraph
 
 
-def _extract_text(resp) -> str:
-    # 1) Responses API convenience
-    t = getattr(resp, "output_text", None)
-    if t:
-        return t
-
-    # 2) Responses API: walk output -> message -> content
-    try:
-        pieces = []
-        for item in getattr(resp, "output", []) or []:
-            if getattr(item, "type", None) == "message":
-                for c in getattr(item, "content", []) or []:
-                    ctype = getattr(c, "type", None) or (isinstance(c, dict) and c.get("type"))
-                    if ctype in ("output_text", "text"):
-                        # pydantic object or dict
-                        text = getattr(c, "text", None) if hasattr(c, "text") else c.get("text")
-                        if text:
-                            pieces.append(text)
-        if pieces:
-            return "".join(pieces)
-    except Exception:
-        pass
-
-    # 3) Chat Completions fallback (if you switch endpoints)
-    try:
-        return resp.choices[0].message.content
-    except Exception:
-        pass
-
-    return str(resp)
-
-
-def _extract_usage(resp):
-    u = getattr(resp, "usage", None)
-    if not u:
-        return 0, 0, 0
-    # Responses API names
-    input_tokens = getattr(u, "input_tokens", getattr(u, "prompt_tokens", 0))
-    output_tokens = getattr(u, "output_tokens", getattr(u, "completion_tokens", 0))
-    total_tokens = getattr(u, "total_tokens", input_tokens + output_tokens)
-    return input_tokens, output_tokens, total_tokens
-
 class LLMInterface(ABC):
     """Abstract interface for LLM interaction."""
     
     @abstractmethod
-    def query(self, prompt: str) -> str:
+    def query(self, prompt: str, temperature: Optional[float] = None, **kwargs) -> str:
         """
         Query the LLM with a prompt and return response.
         
         Args:
             prompt: The prompt to send to the LLM
+            temperature: Override default temperature (optional)
+            **kwargs: Additional model-specific parameters
         
         Returns:
             The LLM's response as a string
         """
         pass
     
-    def query_with_usage(self, prompt: str) -> Dict[str, Any]:
+    def query_with_usage(self, prompt: str, temperature: Optional[float] = None, **kwargs) -> Dict[str, Any]:
         """Query the LLM and return response with usage stats."""
         # Default implementation for backward compatibility
         return {
-            'response': self.query(prompt),
+            'response': self.query(prompt, temperature=temperature, **kwargs),
             'usage': {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
             'cost': 0.0
         }
@@ -96,13 +56,21 @@ class OpenRouterLLM(LLMInterface):
     OpenRouter provides access to multiple models through a single API.
     """
     
+    # Default system prompt for Boolean logic tasks
+    DEFAULT_SYSTEM_PROMPT = (
+        "You are an expert in Boolean logic and symbolic reasoning. "
+        "You excel at evaluating complex Boolean expressions involving AND, OR, NOT, and NOR operations. "
+        "You carefully parse logical operators and variable assignments to determine truth values with precision."
+    )
+    
     def __init__(
         self,
         model: str = "anthropic/claude-3.5-sonnet",
         api_key: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 40960,
-        base_url: str = "https://openrouter.ai/api/v1"
+        base_url: str = "https://openrouter.ai/api/v1",
+        system_prompt: Optional[str] = None
     ):
         """
         Initialize OpenRouter LLM interface.
@@ -110,50 +78,74 @@ class OpenRouterLLM(LLMInterface):
         Args:
             model: Model identifier (e.g., "anthropic/claude-3.5-sonnet", "openai/gpt-4")
             api_key: OpenRouter API key
-            temperature: Sampling temperature
+            temperature: Default sampling temperature
             max_tokens: Maximum tokens in response
             base_url: OpenRouter API base URL
+            system_prompt: Custom system prompt (uses DEFAULT_SYSTEM_PROMPT if None)
         """
         if not api_key:
             raise ValueError("OpenRouter API key is required")
         
         self.model = model
         self.api_key = api_key
-        self.temperature = temperature
+        self.default_temperature = temperature
         self.max_tokens = max_tokens
         self.base_url = base_url
+        self.system_prompt = system_prompt if system_prompt is not None else self.DEFAULT_SYSTEM_PROMPT
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
-            # "HTTP-Referer":"http://localhost:3000",  # Required by OpenRouter
-            # "X-Title": "Cre ativity Benchmark"  # Optional, for OpenRouter dashboard
         }
     
-    def query(self, prompt: str) -> str:
+    def query(self, prompt: str, temperature: Optional[float] = None, 
+              top_p: Optional[float] = None, max_tokens: Optional[int] = None,
+              system_prompt: Optional[str] = None) -> str:
         """Query OpenRouter API."""
-        result = self.query_with_usage(prompt)
+        result = self.query_with_usage(
+            prompt, 
+            temperature=temperature, 
+            top_p=top_p, 
+            max_tokens=max_tokens,
+            system_prompt=system_prompt
+        )
         return result['response']
     
-    def query_with_usage(self, prompt: str) -> Dict[str, Any]:
+    def query_with_usage(self, prompt: str, temperature: Optional[float] = None,
+                        top_p: Optional[float] = None, max_tokens: Optional[int] = None,
+                        system_prompt: Optional[str] = None) -> Dict[str, Any]:
         """Query OpenRouter API with usage tracking."""
         try:
             url = f"{self.base_url}/chat/completions"
+            
+            # Build messages with system prompt
+            messages = [
+                {
+                    "role": "system", 
+                    "content": system_prompt if system_prompt is not None else self.system_prompt
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ]
+            
+            # Build payload
             payload = {
                 "model": self.model,
-                "messages": [
-                    {"role": "system", "content": "You are an expert in causal inference and graph theory."},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": self.temperature,
-                "max_tokens": self.max_tokens
+                "messages": messages,
+                "temperature": temperature if temperature is not None else self.default_temperature,
+                "max_tokens": max_tokens if max_tokens is not None else self.max_tokens
             }
             
-            response = requests.post(url, headers=self.headers, json=payload)
+            # Add top_p if specified
+            if top_p is not None:
+                payload["top_p"] = top_p
+            
+            response = requests.post(url, headers=self.headers, json=payload, timeout=60)
             response.raise_for_status()
-            # print('result0',response)
+            
             result = response.json()
-            # print('result1',result['choices'][0]['message']['content'])
-            # print('result2',result)
+            
             # Extract usage information
             usage = result.get('usage', {})
             usage_data = {
@@ -197,9 +189,11 @@ class OpenRouterLLM(LLMInterface):
             'anthropic/claude-3.5-sonnet': {'input': 3.0, 'output': 15.0},
             'anthropic/claude-3-opus': {'input': 15.0, 'output': 75.0},
             'openai/gpt-4o': {'input': 2.5, 'output': 10.0},
+            'openai/gpt-3.5-turbo': {'input': 0.5, 'output': 1.5},
             'meta-llama/llama-3.3-70b-instruct': {'input': 0.038, 'output': 0.12},
+            'google/gemini-2.0-flash-exp': {'input': 0.0, 'output': 0.0},
             'google/gemini-2.5-pro': {'input': 1.25, 'output': 10.0},
-            'deepseek/deepseek-r1': {'input': 0.4, 'output': 2},
+            'deepseek/deepseek-r1': {'input': 0.4, 'output': 2.0},
         }
         return pricing_map.get(self.model, {'input': 1.0, 'output': 1.0})
 
@@ -211,12 +205,20 @@ class OpenAILLM(LLMInterface):
     Requires openai package and API key.
     """
     
+    # Default system prompt for Boolean logic tasks
+    DEFAULT_SYSTEM_PROMPT = (
+        "You are an expert in Boolean logic and symbolic reasoning. "
+        "You excel at evaluating complex Boolean expressions involving AND, OR, NOT, and NOR operations. "
+        "You carefully parse logical operators and variable assignments to determine truth values with precision."
+    )
+    
     def __init__(
         self, 
         model: str = "gpt-4",
         api_key: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 40960
+        max_tokens: int = 40960,
+        system_prompt: Optional[str] = None
     ):
         """
         Initialize OpenAI LLM interface.
@@ -224,8 +226,9 @@ class OpenAILLM(LLMInterface):
         Args:
             model: OpenAI model to use
             api_key: OpenAI API key (uses environment variable if not provided)
-            temperature: Sampling temperature
+            temperature: Default sampling temperature
             max_tokens: Maximum tokens in response
+            system_prompt: Custom system prompt (uses DEFAULT_SYSTEM_PROMPT if None)
         """
         try:
             import openai
@@ -233,8 +236,9 @@ class OpenAILLM(LLMInterface):
             raise ImportError("Please install openai package: pip install openai")
         
         self.model = model
-        self.temperature = temperature
+        self.default_temperature = temperature
         self.max_tokens = max_tokens
+        self.system_prompt = system_prompt if system_prompt is not None else self.DEFAULT_SYSTEM_PROMPT
         
         if not api_key:
             import os
@@ -244,46 +248,74 @@ class OpenAILLM(LLMInterface):
         
         self.client = openai.OpenAI(api_key=api_key)
     
-    def query(self, prompt: str) -> str:
+    def query(self, prompt: str, temperature: Optional[float] = None,
+              top_p: Optional[float] = None, max_tokens: Optional[int] = None,
+              system_prompt: Optional[str] = None) -> str:
         """Query OpenAI API."""
-        result = self.query_with_usage(prompt)
+        result = self.query_with_usage(
+            prompt, 
+            temperature=temperature, 
+            top_p=top_p, 
+            max_tokens=max_tokens,
+            system_prompt=system_prompt
+        )
         return result['response']
     
-    def query_with_usage(self, prompt: str) -> Dict[str, Any]:
+    def query_with_usage(self, prompt: str, temperature: Optional[float] = None,
+                        top_p: Optional[float] = None, max_tokens: Optional[int] = None,
+                        system_prompt: Optional[str] = None) -> Dict[str, Any]:
+        """Query OpenAI API with usage tracking."""
         try:
-            # print(self.max_tokens)
-            resp = self.client.responses.create(
-                model=self.model,
-                input=[
-                    {"role": "system", "content": "You are an expert in causal inference and graph theory."},
-                    {"role": "user", "content": prompt},
-                ],
-                reasoning={"effort": "medium"},
-                max_output_tokens=self.max_tokens
-            )
-
-            text = _extract_text(resp)
-            in_tok, out_tok, tot_tok = _extract_usage(resp)
-
-            pricing = self.get_model_pricing()
-            cost = (in_tok * pricing['input'] + out_tok * pricing['output']) / 1_000_000
-
-            # print(text)
-            return {
-                "response": text,
-                "usage": {
-                    "prompt_tokens": in_tok,
-                    "completion_tokens": out_tok,
-                    "total_tokens": tot_tok,
+            # Build messages with system prompt
+            messages = [
+                {
+                    "role": "system", 
+                    "content": system_prompt if system_prompt is not None else self.system_prompt
                 },
-                "cost": cost,
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ]
+            
+            # Build kwargs
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature if temperature is not None else self.default_temperature,
+                "max_tokens": max_tokens if max_tokens is not None else self.max_tokens
             }
+            
+            if top_p is not None:
+                kwargs["top_p"] = top_p
+            
+            # Use standard chat completions API
+            response = self.client.chat.completions.create(**kwargs)
+            
+            # Extract usage
+            usage_data = {
+                'prompt_tokens': response.usage.prompt_tokens if response.usage else 0,
+                'completion_tokens': response.usage.completion_tokens if response.usage else 0,
+                'total_tokens': response.usage.total_tokens if response.usage else 0
+            }
+            
+            # Calculate cost
+            pricing = self.get_model_pricing()
+            cost = (usage_data['prompt_tokens'] * pricing['input'] + 
+                   usage_data['completion_tokens'] * pricing['output']) / 1_000_000
+            
+            return {
+                'response': response.choices[0].message.content,
+                'usage': usage_data,
+                'cost': cost
+            }
+            
         except Exception as e:
             traceback.print_exc()
             return {
-                "response": f"Error querying OpenAI: {str(e)}",
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                "cost": 0.0,
+                'response': f"Error querying OpenAI: {str(e)}",
+                'usage': {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
+                'cost': 0.0
             }
     
     def get_name(self) -> str:
@@ -296,7 +328,9 @@ class OpenAILLM(LLMInterface):
         pricing_map = {
             'gpt-4o': {'input': 2.5, 'output': 10.0},
             'gpt-4o-mini': {'input': 0.15, 'output': 0.6},
-            'gpt-5': {'input': 1.25, 'output': 10.0}
+            'gpt-4-turbo': {'input': 10.0, 'output': 30.0},
+            'gpt-4': {'input': 30.0, 'output': 60.0},
+            'gpt-3.5-turbo': {'input': 0.5, 'output': 1.5},
         }
         return pricing_map.get(self.model, {'input': 10.0, 'output': 30.0})
 
@@ -308,12 +342,20 @@ class AnthropicLLM(LLMInterface):
     Requires anthropic package and API key.
     """
     
+    # Default system prompt for Boolean logic tasks
+    DEFAULT_SYSTEM_PROMPT = (
+        "You are an expert in Boolean logic and symbolic reasoning. "
+        "You excel at evaluating complex Boolean expressions involving AND, OR, NOT, and NOR operations. "
+        "You carefully parse logical operators and variable assignments to determine truth values with precision."
+    )
+    
     def __init__(
         self,
         model: str = "claude-3-opus-20240229",
         api_key: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 500
+        max_tokens: int = 4096,
+        system_prompt: Optional[str] = None
     ):
         """
         Initialize Anthropic LLM interface.
@@ -321,8 +363,9 @@ class AnthropicLLM(LLMInterface):
         Args:
             model: Anthropic model to use
             api_key: Anthropic API key (uses environment variable if not provided)
-            temperature: Sampling temperature
+            temperature: Default sampling temperature
             max_tokens: Maximum tokens in response
+            system_prompt: Custom system prompt (uses DEFAULT_SYSTEM_PROMPT if None)
         """
         try:
             import anthropic
@@ -330,27 +373,50 @@ class AnthropicLLM(LLMInterface):
             raise ImportError("Please install anthropic package: pip install anthropic")
         
         self.model = model
-        self.temperature = temperature
+        self.default_temperature = temperature
         self.max_tokens = max_tokens
+        self.system_prompt = system_prompt if system_prompt is not None else self.DEFAULT_SYSTEM_PROMPT
+        
+        if not api_key:
+            import os
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+            if not api_key:
+                raise ValueError("Anthropic API key must be provided or set as ANTHROPIC_API_KEY environment variable")
         
         self.client = anthropic.Anthropic(api_key=api_key)
     
-    def query(self, prompt: str) -> str:
+    def query(self, prompt: str, temperature: Optional[float] = None,
+              top_p: Optional[float] = None, max_tokens: Optional[int] = None,
+              system_prompt: Optional[str] = None) -> str:
         """Query Anthropic API."""
-        result = self.query_with_usage(prompt)
+        result = self.query_with_usage(
+            prompt, 
+            temperature=temperature, 
+            top_p=top_p, 
+            max_tokens=max_tokens,
+            system_prompt=system_prompt
+        )
         return result['response']
     
-    def query_with_usage(self, prompt: str) -> Dict[str, Any]:
+    def query_with_usage(self, prompt: str, temperature: Optional[float] = None,
+                        top_p: Optional[float] = None, max_tokens: Optional[int] = None,
+                        system_prompt: Optional[str] = None) -> Dict[str, Any]:
         """Query Anthropic API with usage tracking."""
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                # max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
+            # Build kwargs
+            kwargs = {
+                "model": self.model,
+                "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
+                "temperature": temperature if temperature is not None else self.default_temperature,
+                "system": system_prompt if system_prompt is not None else self.system_prompt,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            
+            # Add top_p if specified
+            if top_p is not None:
+                kwargs["top_p"] = top_p
+            
+            response = self.client.messages.create(**kwargs)
             
             # Extract usage information
             usage = {
@@ -370,6 +436,7 @@ class AnthropicLLM(LLMInterface):
                 'cost': cost
             }
         except Exception as e:
+            traceback.print_exc()
             return {
                 'response': f"Error querying Anthropic: {str(e)}",
                 'usage': {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},

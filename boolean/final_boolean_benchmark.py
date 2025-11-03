@@ -9,10 +9,10 @@ import numpy as np
 import ast
 import sympy as sp
 from pathlib import Path
-from typing import List, Dict, Set, Tuple, Optional
+from typing import List, Dict, Set, Tuple, Optional, Any
 from datetime import datetime
 from textwrap import dedent
-from collections import Counter
+from collections import Counter, defaultdict
 from scipy import stats
 import traceback
 
@@ -22,14 +22,233 @@ sys.path.append(str(Path(__file__).parent))
 from modules.llm_interface import LLMInterface, OpenRouterLLM, OpenAILLM, AnthropicLLM
 from boolean_dataset import BooleanExpression, BooleanObservation
 
+###########################################################################
+# ACE Playbook: Cross-basic/extended/full semantic notes + dynamic hints  #
+###########################################################################
+class ACEPlaybook:
+    """
+    A lightweight ACE-style prompt augmenter that:
+    - Provides cross-dataset semantic notes (hard constraints reminder)
+    - Generates dynamic suggestions based on last round errors and coverage state
+    It does not change metrics definitions and keeps output format untouched.
+    """
+    def __init__(self, variables: List[str], operators: Set[str], max_depth: int):
+        self.variables = variables
+        self.operators = operators
+        self.max_depth = max_depth
+        # Keep only the last few dynamic suggestions to avoid prompt bloat
+        self.dynamic_suggestions: List[str] = []
+        self.max_suggestions = 3
 
+    def _semantic_notes(self) -> List[str]:
+        # Cross-dataset, operator-agnostic hard constraints reminders
+        notes = [
+            f"Use ONLY variables: {', '.join(self.variables)}",
+            f"Use ONLY allowed operators: {', '.join(sorted(self.operators))}",
+            f"Expression must match ALL given observations",
+            f"Expression depth ≤ {self.max_depth} (count by nesting of operations/parentheses)",
+            "Do NOT use boolean constants True/False or numeric literals",
+            "Return exactly one line starting with 'Expression: ' followed by the expression",
+            "Avoid LaTeX/markdown/symbolic glyphs; use uppercase operators, lowercase variables"
+        ]
+        return notes
+
+    def _truncate_push(self, text: str):
+        self.dynamic_suggestions.append(text)
+        if len(self.dynamic_suggestions) > self.max_suggestions:
+            self.dynamic_suggestions = self.dynamic_suggestions[-self.max_suggestions:]
+
+    def reflect_and_update(
+        self,
+        last_prompt: str,
+        last_response: Optional[str],
+        parsed_expr: Optional[str],
+        in_space: bool,
+        valid_against_obs: bool,
+        error_type: Optional[str],
+        seen_mechanistic_keys: Set[Tuple]
+    ):
+        """
+        Update dynamic suggestions based on last round signals.
+        error_type: classified error name or None
+        seen_mechanistic_keys: mechanistic keys already explored in-space (for novelty guidance)
+        """
+        # Parse/format errors
+        if error_type:
+            et = error_type.lower()
+            if "json" in et or "parse" in et:
+                self._truncate_push("Strictly follow the output format: a single line starting with 'Expression: ' and nothing else.")
+            elif "variable" in et:
+                self._truncate_push("Use ONLY the allowed variables; remove any unknown symbols or constants.")
+            elif "operator" in et or "forbidden" in et:
+                self._truncate_push("Use ONLY the allowed operators; replace any unsupported operator with an allowed one.")
+            elif "constant" in et:
+                self._truncate_push("Do NOT use True/False constants or numeric literals in the expression.")
+            elif "depth" in et:
+                self._truncate_push(f"Reduce nesting to keep depth ≤ {self.max_depth}; simplify parentheses and avoid redundant NOT chains.")
+            elif "timeout" in et or "rate_limit" in et:
+                # Non-behavioral; avoid spamming the prompt
+                pass
+
+        # Space violation without a specific error type
+        if parsed_expr and not in_space:
+            self._truncate_push("Ensure the expression stays within the space: allowed variables/operators only, no constants, and depth within limit.")
+
+        # Mismatch with observations
+        if parsed_expr and in_space and not valid_against_obs:
+            # Cross-dataset discriminative guidance
+            self._truncate_push(
+                "Use a discriminative plan: ensure consistency with observed points; if multiple candidates remain, mentally check unobserved inputs in a fixed order (e.g., lexicographic) and prefer expressions that differentiate those points the most."
+            )
+
+        # Novelty encouragement against mechanistic duplicates
+        if seen_mechanistic_keys:
+            self._truncate_push("Avoid mechanisms equivalent to previously attempted ones; do not only re-parenthesize or reorder the same operator. Change the operator mix or decision structure meaningfully.")
+
+    def get_prompt_blocks(self) -> Tuple[str, str]:
+        semantic_notes = self._semantic_notes()
+        sem_block = "- " + "\n- ".join(semantic_notes)
+        sug_block = "None" if not self.dynamic_suggestions else "- " + "\n- ".join(self.dynamic_suggestions)
+        return sem_block, sug_block
+
+
+#############################################################
+# Self-consistency majority vote within a single LLM query  #
+#############################################################
+class SelfConsistencyModule:
+    """
+    For one logical query, sample multiple completions from the LLM and select
+    a single final expression by majority vote over mechanistic keys.
+    - Keeps per-query output cardinality = 1 (compatible with existing metrics)
+    """
+    def __init__(self, num_samples: int = 5, temperature: float = 0.9):
+        self.num_samples = max(1, int(num_samples))
+        self.temperature = temperature
+
+    def query_with_vote(
+        self,
+        llm: LLMInterface,
+        prompt: str,
+        parse_fn,
+        in_space_fn,
+        mech_key_fn,
+        validate_fn
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """
+        Returns:
+          - chosen expression string or None
+          - usage dict: prompt_tokens, completion_tokens, total_tokens, cost
+        """
+        candidates: List[str] = []
+        mech_keys: List[Optional[Tuple]] = []
+        valid_flags: List[bool] = []
+        usage_aggr = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost": 0.0
+        }
+
+        # Temporarily override llm temperature if supported
+        set_temp = getattr(llm, "set_temperature", None)
+        orig_temp = getattr(llm, "temperature", None)
+        if callable(set_temp) and self.temperature is not None:
+            try:
+                set_temp(self.temperature)
+            except:
+                pass
+
+        try:
+            for _ in range(self.num_samples):
+                if hasattr(llm, 'query_with_usage'):
+                    result = llm.query_with_usage(prompt)
+                    response = result['response']
+                    usage_aggr["prompt_tokens"] += result['usage']['prompt_tokens']
+                    usage_aggr["completion_tokens"] += result['usage']['completion_tokens']
+                    usage_aggr["total_tokens"] += result['usage']['total_tokens']
+                    usage_aggr["cost"] += result.get('cost', 0.0)
+                else:
+                    response = llm.query(prompt)
+
+                if isinstance(response, str) and response.startswith("Error querying"):
+                    # do not early stop; continue sampling to allow others to succeed
+                    continue
+
+                expr = parse_fn(response)
+                if not expr:
+                    candidates.append(None)  # keep position for tally
+                    mech_keys.append(None)
+                    valid_flags.append(False)
+                    continue
+
+                # in-space filter
+                in_space = in_space_fn(expr)
+                if not in_space:
+                    candidates.append(None)
+                    mech_keys.append(None)
+                    valid_flags.append(False)
+                    continue
+
+                # validate against observations inside validate_fn
+                is_valid, _ = validate_fn(expr)
+                candidates.append(expr)
+                mk = mech_key_fn(expr)
+                mech_keys.append(mk)
+                valid_flags.append(bool(is_valid))
+
+            # Majority voting over mechanistic keys among valid ones; fallback to any in-space
+            counter = Counter()
+            for mk, ok in zip(mech_keys, valid_flags):
+                if mk is not None and ok:
+                    counter[mk] += 1
+
+            chosen_expr = None
+            if counter:
+                # choose mk with highest count; pick first candidate with that mk and valid
+                best_mk, _ = counter.most_common(1)[0]
+                for expr, mk, ok in zip(candidates, mech_keys, valid_flags):
+                    if ok and mk == best_mk and expr is not None:
+                        chosen_expr = expr
+                        break
+            else:
+                # fallback: choose any in-space candidate (even if invalid) with most common mk
+                counter_any = Counter([mk for mk in mech_keys if mk is not None])
+                if counter_any:
+                    best_mk, _ = counter_any.most_common(1)[0]
+                    for expr, mk in zip(candidates, mech_keys):
+                        if expr is not None and mk == best_mk:
+                            chosen_expr = expr
+                            break
+                else:
+                    # last resort: first non-empty expr
+                    for expr in candidates:
+                        if expr:
+                            chosen_expr = expr
+                            break
+
+            return chosen_expr, usage_aggr
+        finally:
+            if callable(set_temp) and orig_temp is not None:
+                try:
+                    set_temp(orig_temp)
+                except:
+                    pass
+
+
+#########################################
+# Refined Boolean Benchmark (merged)    #
+#########################################
 class BooleanBenchmarkRefined:
-    def __init__(self, complete_dataset_path: str):
+    def __init__(self, complete_dataset_path: str, enable_ace: bool = True, enable_self_consistency: bool = True, sc_num_samples: int = 5, sc_temperature: float = 0.9):
         """
         Initialize benchmark with a complete dataset.
         
         Args:
             complete_dataset_path: Path to the complete Boolean dataset JSON file
+            enable_ace: whether to enable ACE prompt augmentation
+            enable_self_consistency: whether to enable self-consistency module
+            sc_num_samples: samples per query when self-consistency enabled
+            sc_temperature: temperature used for self-consistency sampling
         """
         with open(complete_dataset_path, 'r') as f:
             self.complete_dataset = json.load(f)
@@ -46,21 +265,34 @@ class BooleanBenchmarkRefined:
         for n_obs, datasets in self.complete_dataset['datasets_by_n_observations'].items():
             self.all_observation_sets.extend(datasets)
         
+        # ACE and SC modules
+        self.enable_ace = enable_ace
+        self.ace = ACEPlaybook(self.variables, self.operators, self.max_depth) if enable_ace else None
+        self.enable_self_consistency = enable_self_consistency
+        self.sc = SelfConsistencyModule(num_samples=sc_num_samples, temperature=sc_temperature) if enable_self_consistency else None
+
+        # Basic/extended/full profile (for logs only)
+        self.profile = self._infer_profile(self.operators)
+
         print(f"Loaded complete dataset with {len(self.all_observation_sets)} observation sets")
         print(f"Variables: {', '.join(self.variables)}")
         print(f"Operators: {', '.join(self.operators)}")
         print(f"Max depth: {self.max_depth}")
+        print(f"Profile: {self.profile}")
+        print(f"ACE: {'on' if self.enable_ace else 'off'}, Self-consistency: {'on' if self.enable_self_consistency else 'off'}")
+    
+    def _infer_profile(self, ops: Set[str]) -> str:
+        # Heuristic tag
+        base = {"AND", "OR"}
+        if ops == base:
+            return "basic"
+        if "NOT" in ops or "XOR" in ops or "NOR" in ops:
+            return "extended/full"
+        return "custom"
     
     def sample_observation_sets(self, n_samples: int, seed: Optional[int] = None) -> List[Dict]:
         """
         Sample n observation sets from the complete dataset.
-        
-        Args:
-            n_samples: Number of observation sets to sample
-            seed: Random seed for reproducibility
-        
-        Returns:
-            List of sampled observation sets
         """
         if seed is not None:
             random.seed(seed)
@@ -79,7 +311,7 @@ class BooleanBenchmarkRefined:
     def create_prompt(self, observations: List[BooleanObservation], 
                      prior_hypotheses: List[str]) -> str:
         # Build obs_block, prior_block, operators_str ...
-                # Format observations
+        # Format observations
         obs_lines = []
         for obs in observations:
             obs_lines.append(obs.to_string())
@@ -134,6 +366,20 @@ class BooleanBenchmarkRefined:
 
         rules_text = "\n        ".join(eq_rules)
 
+        # ACE blocks
+        ace_sem_block = ""
+        ace_sug_block = ""
+        if self.enable_ace and self.ace:
+            sem_block, sug_block = self.ace.get_prompt_blocks()
+            ace_sem_block = f"""
+            ACE Semantic Notes:
+            {sem_block}
+            """.rstrip()
+            ace_sug_block = f"""
+            ACE Suggestions (dynamic, optional to follow for better coverage/novelty):
+            {sug_block}
+            """.rstrip()
+
         prompt = f"""You are given partial observations of a Boolean function with variables: {', '.join(self.variables)}
 
             Allowed operators: {operators_str}
@@ -144,6 +390,10 @@ class BooleanBenchmarkRefined:
             Prior expressions generated (avoid repeating any expression 
             that is equivalent under the rules below):
             {prior_block}
+
+            {ace_sem_block}
+
+            {ace_sug_block}
 
             Task: Generate a single Boolean expression that is consistent with ALL observations.
 
@@ -160,7 +410,7 @@ class BooleanBenchmarkRefined:
             - Return ONLY the Boolean expression on a single line
             - Use plain text format (no LaTeX, no markdown, no special formatting)
             - Use uppercase for operators. 
-            - Use lowercase for variables: x, y
+            - Use lowercase for variables: {', '.join(self.variables)}
             - Use parentheses for grouping when needed
             - Start your response with "Expression: " followed by the expression
             
@@ -473,56 +723,110 @@ class BooleanBenchmarkRefined:
         # Track errors
         errors = []  # List of error details
         error_counts = {}  # Count of each error type
-        
+
+        # Keep set of seen mechanistic keys for ACE novelty guidance
+        seen_mech_keys_in_space: Set[Tuple] = set()
+
         for i in range(n_queries):
             prompt = self.create_prompt(observations, all_hypotheses)
             
             # Try to get a valid response
             hypothesis_str = None
             query_error = None
-            for attempt in range(max_retries):
-                # Use query_with_usage if available
-                if hasattr(llm, 'query_with_usage'):
-                    result = llm.query_with_usage(prompt)
-                    response = result['response']
-                    # Track usage
-                    total_prompt_tokens += result['usage']['prompt_tokens']
-                    total_completion_tokens += result['usage']['completion_tokens']
-                    total_tokens += result['usage']['total_tokens']
-                    total_cost += result.get('cost', 0.0)
-                else:
-                    response = llm.query(prompt)
-                
-                # Check if response is an error
-                if response.startswith("Error querying"):
+
+            # Self-consistency path
+            if self.enable_self_consistency and self.sc is not None:
+                def parse_fn(resp): 
+                    return self.parse_llm_response(resp)
+                def in_space_fn(expr):
+                    return self._in_space(expr)
+                def mech_key_fn(expr):
+                    return self.get_expression_mechanistic_key(expr)
+                def validate_fn(expr):
+                    return self.validate_expression(expr, observations)
+
+                chosen_expr, usage = self.sc.query_with_vote(
+                    llm, prompt, parse_fn, in_space_fn, mech_key_fn, validate_fn
+                )
+
+                # Aggregate usage
+                total_prompt_tokens += usage.get("prompt_tokens", 0)
+                total_completion_tokens += usage.get("completion_tokens", 0)
+                total_tokens += usage.get("total_tokens", 0)
+                total_cost += usage.get("cost", 0.0)
+
+                hypothesis_str = chosen_expr
+
+                # If we failed to get any expression, mark an error for visibility
+                if hypothesis_str is None:
                     query_error = {
                         'query_index': i,
-                        'attempt': attempt + 1,
-                        'error_message': response,
-                        'error_type': self._classify_error(response)
+                        'attempt': 1,
+                        'error_message': "self_consistency_failed_to_select",
+                        'error_type': "selection_failure"
                     }
-                    # Track error type count
                     error_type = query_error['error_type']
                     error_counts[error_type] = error_counts.get(error_type, 0) + 1
-                    continue  # Try again
-                
-                hypothesis_str = self.parse_llm_response(response)
-                if hypothesis_str:
-                    break
-            
-            # If all attempts failed, record the error
-            if not hypothesis_str and query_error:
-                errors.append(query_error)
-                # Store detailed error info in all_hypotheses
-                error_detail = f"[ERROR after {max_retries} attempts] Type: {query_error['error_type']} | {query_error['error_message']}"
-                all_hypotheses.append(error_detail)
-            
-            elif hypothesis_str:  # Only if we got a valid hypothesis
+                    errors.append(query_error)
+
+            else:
+                # Original retry loop path
+                for attempt in range(max_retries):
+                    # Use query_with_usage if available
+                    if hasattr(llm, 'query_with_usage'):
+                        result = llm.query_with_usage(prompt)
+                        response = result['response']
+                        # Track usage
+                        total_prompt_tokens += result['usage']['prompt_tokens']
+                        total_completion_tokens += result['usage']['completion_tokens']
+                        total_tokens += result['usage']['total_tokens']
+                        total_cost += result.get('cost', 0.0)
+                    else:
+                        response = llm.query(prompt)
+                    
+                    # Check if response is an error
+                    if isinstance(response, str) and response.startswith("Error querying"):
+                        query_error = {
+                            'query_index': i,
+                            'attempt': attempt + 1,
+                            'error_message': response,
+                            'error_type': self._classify_error(response)
+                        }
+                        # Track error type count
+                        error_type = query_error['error_type']
+                        error_counts[error_type] = error_counts.get(error_type, 0) + 1
+                        continue  # Try again
+                    
+                    hypothesis_str = self.parse_llm_response(response)
+                    if hypothesis_str:
+                        break
+
+                # If all attempts failed, record the error
+                if not hypothesis_str and query_error:
+                    errors.append(query_error)
+                    # Store detailed error info in all_hypotheses
+                    error_detail = f"[ERROR after {max_retries} attempts] Type: {query_error['error_type']} | {query_error['error_message']}"
+                    all_hypotheses.append(error_detail)
+                    # Reflect to ACE
+                    if self.enable_ace and self.ace:
+                        self.ace.reflect_and_update(
+                            last_prompt=prompt,
+                            last_response=None,
+                            parsed_expr=None,
+                            in_space=False,
+                            valid_against_obs=False,
+                            error_type=query_error['error_type'],
+                            seen_mechanistic_keys=seen_mech_keys_in_space
+                        )
+                    continue  # next query
+
+            if hypothesis_str:
                 parse_success_count += 1
                 all_hypotheses.append(hypothesis_str)
                 
                 # Only count novelty for in-space expressions
-                if self._in_space(hypothesis_str):
+                in_space_ok = self._in_space(hypothesis_str)
+                if in_space_ok:
                     in_space_count += 1
                     
                     # Check uniqueness among in-space hypotheses (for novelty calculation)
@@ -530,6 +834,8 @@ class BooleanBenchmarkRefined:
                     if all_mech_key and all_mech_key not in all_unique_mechanistic_keys:
                         all_unique_mechanistic_keys.add(all_mech_key)
                         unique_all_expressions.append(hypothesis_str)
+                        # record for ACE novelty guidance
+                        seen_mech_keys_in_space.add(all_mech_key)
                 
                 # Validate expression against observations
                 is_valid, truth_table = self.validate_expression(hypothesis_str, observations)
@@ -542,12 +848,25 @@ class BooleanBenchmarkRefined:
                     if mech_key and mech_key not in unique_mechanistic_keys:
                         unique_mechanistic_keys.add(mech_key)
                         unique_valid_expressions.append(hypothesis_str)
-        
+
+                # Reflect to ACE with signals
+                if self.enable_ace and self.ace:
+                    self.ace.reflect_and_update(
+                        last_prompt=prompt,
+                        last_response=None,
+                        parsed_expr=hypothesis_str,
+                        in_space=in_space_ok,
+                        valid_against_obs=bool(is_valid),
+                        error_type=None,
+                        seen_mechanistic_keys=seen_mech_keys_in_space
+                    )
+
         # Calculate metrics
-        parse_success_rate = parse_success_count / n_queries if n_queries > 0 else 0
-        in_space_rate = in_space_count / n_queries if n_queries > 0 else 0
-        valid_rate = len(valid_hypotheses) / n_queries if n_queries > 0 else 0
-        novelty_rate = len(unique_all_expressions) / n_queries if n_queries > 0 else 0
+        n_queries_eff = n_queries if n_queries > 0 else 1
+        parse_success_rate = parse_success_count / n_queries_eff
+        in_space_rate = in_space_count / n_queries_eff
+        valid_rate = len(valid_hypotheses) / n_queries_eff
+        novelty_rate = len(unique_all_expressions) / n_queries_eff
         recovery_rate = 0
         
         # Check recovery against ground truths using mechanistic keys (structural matching)
@@ -840,7 +1159,7 @@ class BooleanBenchmarkRefined:
         print("\n" + "=" * 50)
         print("BENCHMARK RESULTS SUMMARY")
         print("=" * 50)
-        print(f"Samples evaluated: {len(all_results)}/{n_samples}")
+        print(f"Samples evaluated: {len(all_results)}")
         
         for metric_name, metric_key in [('Valid Rate', 'valid_rate'), 
                                         ('Novelty Rate', 'novelty_rate'), 
@@ -937,6 +1256,12 @@ def main():
     parser.add_argument("--n-queries", type=int, default=None, help="Fixed number of queries per observation set (if not set, uses adaptive)")
     parser.add_argument("--query-multiplier", type=float, default=1.0, help="Multiplier for adaptive queries (n_queries = n_gt * multiplier)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for sampling")
+    # New flags for self-consistency
+    parser.add_argument("--no-self-consistency", action="store_true", help="Disable self-consistency sampling")
+    parser.add_argument("--sc-num-samples", type=int, default=5, help="Number of samples per query for self-consistency")
+    parser.add_argument("--sc-temperature", type=float, default=0.9, help="Temperature for self-consistency sampling")
+    # Optionally allow disabling ACE (mostly for ablations)
+    parser.add_argument("--no-ace", action="store_true", help="Disable ACE prompt augmentation")
     
     args = parser.parse_args()
     
@@ -984,7 +1309,13 @@ def main():
         output = f"results/{dataset_name}_{model_name}_{timestamp}.json"
 
     # Initialize benchmark
-    benchmark = BooleanBenchmarkRefined(args.dataset)
+    benchmark = BooleanBenchmarkRefined(
+        args.dataset,
+        enable_ace=(not args.no_ace),
+        enable_self_consistency=(not args.no_self_consistency),
+        sc_num_samples=args.sc_num_samples,
+        sc_temperature=args.sc_temperature
+    )
      
     # Print configuration
     print("\n" + "=" * 60)
@@ -998,6 +1329,8 @@ def main():
     print(f"Queries per sample: {args.n_queries}")
     print(f"Seed: {args.seed}")
     print(f"Output: {output}")
+    print(f"ACE: {'on' if not args.no_ace else 'off'}")
+    print(f"Self-consistency: {'on' if not args.no_self_consistency else 'off'} (num_samples={args.sc_num_samples}, temp={args.sc_temperature})")
     print("=" * 60)
     
     # Set up LLM
